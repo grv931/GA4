@@ -1,4 +1,10 @@
-import json, re, hashlib, os, math, struct
+import csv
+import json
+import re
+import hashlib
+import os
+import math
+import struct
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -122,24 +128,56 @@ def generate_q4(email: str):
     return documents, embeddings, reranker_scores
 
 # ============================================================
-# App Startup — generate Q4 data in memory from config.EMAIL
+# App Startup — load Q4 data from dataset files in data/
 # ============================================================
 
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 Q4_DOCS = []
 Q4_EMBEDDINGS = {}
 Q4_RERANKER = {}
+
+def load_q4_data_from_files():
+    docs_path = os.path.join(DATA_DIR, "documents.csv")
+    embeddings_path = os.path.join(DATA_DIR, "embeddings.json")
+    reranker_path = os.path.join(DATA_DIR, "reranker_scores.json")
+
+    with open(docs_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        docs = []
+        for row in reader:
+            docs.append({
+                "doc_id": row["doc_id"],
+                "title": row.get("title", ""),
+                "department": row.get("department", ""),
+                "year": int(row["year"]) if row.get("year") else None,
+                "region": row.get("region", ""),
+                "text": row.get("text", ""),
+            })
+
+    with open(embeddings_path, encoding="utf-8") as f:
+        embeddings = json.load(f)
+
+    with open(reranker_path, encoding="utf-8") as f:
+        reranker_scores = json.load(f)
+
+    return docs, embeddings, reranker_scores
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global Q4_DOCS, Q4_EMBEDDINGS, Q4_RERANKER
     try:
+        docs, embs, reranker = load_q4_data_from_files()
+        Q4_DOCS = docs
+        Q4_EMBEDDINGS = {k: np.array(v, dtype=np.float32) for k, v in embs.items()}
+        Q4_RERANKER = reranker
+        print(f"Q4 data loaded from files: {len(Q4_DOCS)} docs.")
+    except Exception as e:
+        print(f"Failed to load Q4 data from files: {e}")
         docs, embs, reranker = generate_q4(config.EMAIL)
         Q4_DOCS = docs
         Q4_EMBEDDINGS = {k: np.array(v, dtype=np.float32) for k, v in embs.items()}
         Q4_RERANKER = reranker
         print(f"Q4 data generated for {config.EMAIL}: {len(Q4_DOCS)} docs.")
-    except Exception as e:
-        print(f"Failed to generate Q4 data: {e}")
     yield
 
 # ============================================================
@@ -247,43 +285,49 @@ async def vector_search(request: Request):
     body = await request.json()
     query_id = body.get("query_id")
     query_vector = np.array(body.get("query_vector", []), dtype=np.float32)
-    top_k = body.get("top_k", 10)
-    rerank_top_n = body.get("rerank_top_n", 3)
-    filters = body.get("filter", {})
-    # 1. Filter documents
-    filtered_docs = []
-    for doc in Q4_DOCS:
-        match = True
-        for key, condition in filters.items():
-            if isinstance(condition, dict):
-                if "gte" in condition and not (doc.get(key, 0) >= condition["gte"]):
-                    match = False
-                if "lte" in condition and not (doc.get(key, 0) <= condition["lte"]):
-                    match = False
-                if "in" in condition and doc.get(key) not in condition["in"]:
-                    match = False
-            else:
-                if doc.get(key) != condition:
-                    match = False
-        if match:
-            filtered_docs.append(doc)
-    # 2. Cosine similarity
+    if query_vector.ndim != 1:
+        query_vector = query_vector.flatten()
+    top_k = int(body.get("top_k", 10))
+    rerank_top_n = int(body.get("rerank_top_n", 3))
+    filters = body.get("filter", {}) or {}
+
+    def matches_filter(doc, key, condition):
+        value = doc.get(key)
+        if isinstance(condition, dict):
+            if "gte" in condition:
+                if value is None or value < condition["gte"]:
+                    return False
+            if "lte" in condition:
+                if value is None or value > condition["lte"]:
+                    return False
+            if "in" in condition:
+                allowed = condition["in"]
+                if not isinstance(allowed, list) or value not in allowed:
+                    return False
+            return True
+        return value == condition
+
+    filtered_docs = [doc for doc in Q4_DOCS if all(matches_filter(doc, key, condition) for key, condition in filters.items())]
+
     scored_docs = []
     for doc in filtered_docs:
         doc_id = doc["doc_id"]
         doc_emb = Q4_EMBEDDINGS.get(doc_id)
-        if doc_emb is not None:
-            sim = cosine_sim(query_vector, doc_emb)
-            scored_docs.append({"doc_id": doc_id, "sim": sim})
-    # 3. Top-k (desc sim, tie-break lexicographic)
+        if doc_emb is None:
+            continue
+        sim = cosine_sim(query_vector, doc_emb)
+        scored_docs.append({"doc_id": doc_id, "sim": sim})
+
     scored_docs.sort(key=lambda x: (-x["sim"], x["doc_id"]))
     top_k_docs = scored_docs[:top_k]
-    # 4. Re-rank
+
     rerank_scores = Q4_RERANKER.get(query_id, {})
     for doc in top_k_docs:
         doc["rerank_score"] = rerank_scores.get(doc["doc_id"], -999.0)
+
     top_k_docs.sort(key=lambda x: (-x["rerank_score"], x["doc_id"]))
-    return {"matches": [d["doc_id"] for d in top_k_docs[:rerank_top_n]]}
+    matches = [d["doc_id"] for d in top_k_docs[:rerank_top_n]]
+    return {"matches": matches}
 
 # ================= Q5: GraphRAG Endpoints =================
 @app.post("/extract-graph")
